@@ -1,0 +1,169 @@
+version: '3.8'
+
+services:
+  # ClickHouse Database with automatic initialization
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.12-alpine
+    container_name: clickhouse-test
+    hostname: clickhouse
+    restart: unless-stopped
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      - CLICKHOUSE_DB=netdata_metrics
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse-init:/docker-entrypoint-initdb.d
+      - ./clickhouse-config/users.xml:/etc/clickhouse-server/users.xml
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - monitoring-network
+
+  # PostgreSQL for Metabase
+  postgres:
+    image: postgres:13
+    container_name: postgres-metabase
+    environment:
+      - POSTGRES_DB=metabase
+      - POSTGRES_USER=metabase
+      - POSTGRES_PASSWORD=metabase123
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U metabase"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - monitoring-network
+
+  # Metabase Dashboard
+  metabase:
+    image: metabase/metabase:latest
+    container_name: metabase-dashboard
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - MB_DB_TYPE=postgres
+      - MB_DB_DBNAME=metabase
+      - MB_DB_PORT=5432
+      - MB_DB_USER=metabase
+      - MB_DB_PASS=metabase123
+      - MB_DB_HOST=postgres
+      - JAVA_OPTS=-Xmx2g
+    volumes:
+      - metabase-data:/metabase-data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - monitoring-network
+
+  # Netdata to ClickHouse Proxy
+  netdata-clickhouse-proxy:
+    build:
+      context: ./netdata-proxy
+      dockerfile: Dockerfile
+    container_name: netdata-proxy
+    restart: unless-stopped
+    ports:
+      - "8080:8080"  # TCP for Netdata JSONL
+      - "8081:8081"  # HTTP for data generator and health checks
+    environment:
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+      - CLICKHOUSE_DATABASE=netdata_metrics
+      - LOG_LEVEL=info
+      - NODE_ENV=production
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8081/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - monitoring-network
+
+  # Netdata Parent Node (Test Instance)
+  netdata-parent:
+    image: netdata/netdata:v2.6.1
+    container_name: netdata-parent
+    hostname: netdata-parent-test
+    restart: unless-stopped
+    ports:
+      - "19998:19999"
+    cap_add:
+      - SYS_PTRACE
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - ./netdata-config:/etc/netdata
+      - netdata-parent-lib:/var/lib/netdata
+      - netdata-parent-cache:/var/cache/netdata
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /etc/passwd:/host/etc/passwd:ro
+      - /etc/group:/host/etc/group:ro
+    environment:
+      - NETDATA_DISABLE_CLOUD=1
+      - NETDATA_EXTRA_DBS=yes
+    depends_on:
+      netdata-clickhouse-proxy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:19999/api/v1/info"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - monitoring-network
+
+volumes:
+  clickhouse-data:
+    driver: local
+  postgres-data:
+    driver: local
+  metabase-data:
+    driver: local
+  netdata-parent-lib:
+    driver: local
+  netdata-parent-cache:
+    driver: local
+
+networks:
+  monitoring-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
