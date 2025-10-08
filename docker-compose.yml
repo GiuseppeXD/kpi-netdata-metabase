@@ -90,8 +90,9 @@ services:
     container_name: netdata-proxy
     restart: unless-stopped
     ports:
-      - "8080:8080"  # TCP for Netdata JSONL
-      - "8081:8081"  # HTTP for data generator and health checks
+      - "8080:8080"  # HTTP for endpoints, data generator and health checks
+      - "8081:8081"  # TCP for Netdata AVERAGE JSONL
+      - "8082:8082"  # TCP for Netdata MAXIMUM JSONL
     environment:
       - CLICKHOUSE_HOST=clickhouse
       - CLICKHOUSE_PORT=8123
@@ -104,7 +105,7 @@ services:
       clickhouse:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8081/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -119,7 +120,7 @@ services:
     hostname: netdata-parent-test
     restart: unless-stopped
     ports:
-      - "19998:19999"
+      - "19998:19998"
     cap_add:
       - SYS_PTRACE
       - SYS_ADMIN
@@ -141,13 +142,60 @@ services:
       netdata-clickhouse-proxy:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:19999/api/v1/info"]
+      test: ["CMD", "curl", "-f", "http://localhost:19998/api/v1/info"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 30s
     networks:
       - monitoring-network
+
+  # Netdata to GraphQL Proxy
+  netdata-graphql-proxy:
+    build:
+      context: ./netdata-proxy-graphql
+      dockerfile: Dockerfile
+    container_name: netdata-graphql-proxy
+    restart: unless-stopped
+    ports:
+      - "8090:8090"  # HTTP for endpoints and health checks
+      - "8091:8091"  # TCP for Netdata AVERAGE JSONL
+      - "8092:8092"  # TCP for Netdata MAXIMUM JSONL
+    environment:
+      - GRAPHQL_ENDPOINT=https://digitalize.oxeanbits.com/graphql
+      - SHEET_ID=68bf175e85d08f78bf97b15f
+      - API_KEY=${API_KEY}
+      - LOG_LEVEL=info
+      - NODE_ENV=production
+      - PORT=8090
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - monitoring-network
+
+  # Netdata Forwarder (SSH Tunnel Metrics)
+  #netdata-forwarder:
+  #  image: python:3.11-slim
+  #  container_name: netdata-forwarder
+  #  restart: unless-stopped
+  #  network_mode: "host"
+  #  volumes:
+  #    - ./netdata-forwarder.py:/app/netdata-forwarder.py:ro
+  #  working_dir: /app
+  #  command: >
+  #    sh -c "
+  #      pip install requests &&
+  #      python netdata-forwarder.py
+  #    "
+  #  environment:
+  #    - PYTHONUNBUFFERED=1
+  #  depends_on:
+  #    netdata-clickhouse-proxy:
+  #      condition: service_healthy
 
 volumes:
   clickhouse-data:

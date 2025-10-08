@@ -30,13 +30,43 @@ app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
-// Main endpoint for Netdata data (handles JSONL format)
-app.post('/', async (req, res) => {
+// Test endpoint to check row count and aggregation types
+app.get('/test', async (req, res) => {
+  try {
+    const totalResult = await clickhouseClient.query({
+      query: 'SELECT count() as total FROM netdata_metrics.metrics',
+      format: 'JSONEachRow',
+    });
+    const totalRows = await totalResult.json();
+
+    const aggResult = await clickhouseClient.query({
+      query: 'SELECT aggregation_type, count() as count FROM netdata_metrics.metrics GROUP BY aggregation_type ORDER BY aggregation_type',
+      format: 'JSONEachRow',
+    });
+    const aggRows = await aggResult.json();
+
+    res.json({
+      status: 'success',
+      total_rows: totalRows[0]?.total || 0,
+      aggregation_breakdown: aggRows,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      message: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Generic function to process metrics with aggregation type
+async function processMetrics(req, res, aggregationType) {
   try {
     const startTime = Date.now();
     let rawData = req.body;
 
-    console.log(`[${new Date().toISOString()}] Raw request:`, {
+    console.log(`[${new Date().toISOString()}] ${aggregationType.toUpperCase()} request:`, {
       type: typeof rawData,
       contentType: req.headers['content-type'],
       size: rawData ? rawData.length || JSON.stringify(rawData).length : 0,
@@ -58,11 +88,11 @@ app.post('/', async (req, res) => {
         }
       }
 
-      console.log(`[${new Date().toISOString()}] Parsed ${rawData.length} metrics from JSONL`);
+      console.log(`[${new Date().toISOString()}] Parsed ${rawData.length} ${aggregationType} metrics from JSONL`);
     }
 
-    // Convert to ClickHouse format
-    const clickhouseRows = convertNetdataToClickHouse(rawData);
+    // Convert to ClickHouse format with aggregation type
+    const clickhouseRows = convertNetdataToClickHouse(rawData, aggregationType);
 
     if (clickhouseRows.length === 0) {
       console.warn('No valid data to insert');
@@ -77,54 +107,79 @@ app.post('/', async (req, res) => {
     await insertToClickHouse(clickhouseRows);
 
     const processingTime = Date.now() - startTime;
-    console.log(`[${new Date().toISOString()}] Successfully inserted ${clickhouseRows.length} rows in ${processingTime}ms`);
+    console.log(`[${new Date().toISOString()}] Successfully inserted ${clickhouseRows.length} ${aggregationType} rows in ${processingTime}ms`);
 
     res.status(200).json({
       status: 'success',
+      aggregation_type: aggregationType,
       rows_inserted: clickhouseRows.length,
       processing_time: processingTime
     });
 
   } catch (error) {
-    console.error('Error processing request:', error);
+    console.error(`Error processing ${aggregationType} request:`, error);
     res.status(500).json({
       status: 'error',
       message: error.message,
       timestamp: new Date().toISOString()
     });
   }
+}
+
+// Main endpoint for Netdata data (legacy - defaults to average)
+app.post('/', async (req, res) => {
+  console.log(`[${new Date().toISOString()}] === MAIN ENDPOINT HIT (defaulting to average) ===`);
+  await processMetrics(req, res, 'average');
+});
+
+// Average metrics endpoint
+app.post('/avg', async (req, res) => {
+  console.log(`[${new Date().toISOString()}] === AVERAGE ENDPOINT HIT ===`);
+  await processMetrics(req, res, 'average');
+});
+
+// Maximum metrics endpoint
+app.post('/max', async (req, res) => {
+  console.log(`[${new Date().toISOString()}] === MAXIMUM ENDPOINT HIT ===`);
+  await processMetrics(req, res, 'maximum');
+});
+
+// Median metrics endpoint
+app.post('/median', async (req, res) => {
+  console.log(`[${new Date().toISOString()}] === MEDIAN ENDPOINT HIT ===`);
+  await processMetrics(req, res, 'median');
 });
 
 // Convert Netdata JSON to ClickHouse rows
-function convertNetdataToClickHouse(data) {
+function convertNetdataToClickHouse(data, aggregationType = 'average') {
   const rows = [];
 
   // Handle array of Netdata metrics (JSONL format)
   if (Array.isArray(data)) {
     data.forEach(metric => {
-      const row = processNetdataMetric(metric);
+      const row = processNetdataMetric(metric, aggregationType);
       if (row) rows.push(row);
     });
   } else if (data.hostname && data.charts) {
     // Legacy single host format (check hostname first!)
     Object.entries(data.charts).forEach(([chartId, chartData]) => {
-      rows.push(...processChart(chartId, chartData, new Date(), data.hostname));
+      rows.push(...processChart(chartId, chartData, new Date(), data.hostname, aggregationType));
     });
   } else if (data.charts) {
     // Legacy charts format without hostname
     Object.entries(data.charts).forEach(([chartId, chartData]) => {
-      rows.push(...processChart(chartId, chartData, new Date()));
+      rows.push(...processChart(chartId, chartData, new Date(), 'unknown', aggregationType));
     });
   } else {
     // Single metric format (legacy)
-    rows.push(...processMetric(data, new Date()));
+    rows.push(...processMetric(data, new Date(), aggregationType));
   }
 
   return rows.filter(row => row && typeof row.value === 'number' && !isNaN(row.value));
 }
 
 // Process individual Netdata metric (from JSONL format)
-function processNetdataMetric(metric) {
+function processNetdataMetric(metric, aggregationType = 'average') {
   if (!metric || typeof metric !== 'object') return null;
 
   // Handle hostname replacement from %H template
@@ -148,6 +203,7 @@ function processNetdataMetric(metric) {
     chart_name: metric.chart_name || metric.chart_id || 'Unknown Chart',
     dimension: metric.id || metric.name || 'value',
     value: parseFloat(metric.value) || 0,
+    aggregation_type: aggregationType,
     units: metric.units || '',
     family: metric.chart_family || '',
     context: metric.chart_context || metric.chart_id || '',
@@ -155,7 +211,7 @@ function processNetdataMetric(metric) {
   };
 }
 
-function processMetric(metric, timestamp) {
+function processMetric(metric, timestamp, aggregationType = 'average') {
   const rows = [];
 
   if (!metric || typeof metric !== 'object') return rows;
@@ -167,6 +223,7 @@ function processMetric(metric, timestamp) {
     hostname: metric.hostname || metric.host || 'unknown',
     chart_id: metric.chart || metric.chart_id || 'unknown',
     chart_name: metric.chart_name || metric.title || metric.chart || 'Unknown Chart',
+    aggregation_type: aggregationType,
     units: metric.units || '',
     family: metric.family || '',
     context: metric.context || metric.chart || '',
@@ -195,7 +252,7 @@ function processMetric(metric, timestamp) {
   return rows;
 }
 
-function processChart(chartId, chartData, timestamp, hostname = 'unknown') {
+function processChart(chartId, chartData, timestamp, hostname = 'unknown', aggregationType = 'average') {
   const rows = [];
 
   if (!chartData || typeof chartData !== 'object') return rows;
@@ -207,6 +264,7 @@ function processChart(chartId, chartData, timestamp, hostname = 'unknown') {
     hostname: hostname,
     chart_id: chartId,
     chart_name: chartData.name || chartData.title || chartId,
+    aggregation_type: aggregationType,
     units: chartData.units || '',
     family: chartData.family || '',
     context: chartData.context || chartId,
@@ -233,13 +291,6 @@ function processChart(chartId, chartData, timestamp, hostname = 'unknown') {
 async function insertToClickHouse(rows) {
   if (rows.length === 0) return;
 
-  const query = `
-    INSERT INTO metrics (
-      timestamp, hostname, chart_id, chart_name, dimension,
-      value, units, family, context, chart_type
-    ) VALUES
-  `;
-
   try {
     await clickhouseClient.insert({
       table: 'metrics',
@@ -265,9 +316,20 @@ app.use((error, req, res, next) => {
 // TCP Server for raw Netdata connections (JSONL format)
 const net = require('net');
 
-const tcpServer = net.createServer((socket) => {
-  console.log(`[${new Date().toISOString()}] Raw TCP connection from ${socket.remoteAddress}:${socket.remotePort}`);
+// Create TCP server for average data
+const tcpServerAvg = net.createServer((socket) => {
+  console.log(`[${new Date().toISOString()}] AVERAGE TCP connection from ${socket.remoteAddress}:${socket.remotePort}`);
+  handleTcpConnection(socket, 'average');
+});
 
+// Create TCP server for maximum data  
+const tcpServerMax = net.createServer((socket) => {
+  console.log(`[${new Date().toISOString()}] MAXIMUM TCP connection from ${socket.remoteAddress}:${socket.remotePort}`);
+  handleTcpConnection(socket, 'maximum');
+});
+
+// Handle TCP connection data processing
+function handleTcpConnection(socket, aggregationType) {
   let buffer = '';
 
   socket.on('data', async (data) => {
@@ -278,7 +340,7 @@ const tcpServer = net.createServer((socket) => {
     buffer = lines.pop(); // Keep incomplete line in buffer
 
     if (lines.length > 0) {
-      console.log(`[${new Date().toISOString()}] Received ${lines.length} JSONL lines from Netdata`);
+      console.log(`[${new Date().toISOString()}] Received ${lines.length} JSONL lines from Netdata (${aggregationType})`);
 
       try {
         // Parse JSONL lines
@@ -295,46 +357,52 @@ const tcpServer = net.createServer((socket) => {
         }
 
         if (metrics.length > 0) {
-          // Convert to ClickHouse format
-          const clickhouseRows = convertNetdataToClickHouse(metrics);
+          // Convert to ClickHouse format with specific aggregation type
+          const clickhouseRows = convertNetdataToClickHouse(metrics, aggregationType);
 
           if (clickhouseRows.length > 0) {
             // Insert into ClickHouse
             await insertToClickHouse(clickhouseRows);
-            console.log(`[${new Date().toISOString()}] Successfully inserted ${clickhouseRows.length} rows from TCP connection`);
+            console.log(`[${new Date().toISOString()}] Successfully inserted ${clickhouseRows.length} ${aggregationType} rows from TCP connection`);
           }
         }
 
       } catch (error) {
-        console.error('Error processing TCP data:', error);
+        console.error(`Error processing TCP ${aggregationType} data:`, error);
       }
     }
   });
 
   socket.on('end', () => {
-    console.log(`[${new Date().toISOString()}] TCP connection ended`);
+    console.log(`[${new Date().toISOString()}] ${aggregationType} TCP connection ended`);
   });
 
   socket.on('error', (err) => {
-    console.error('TCP socket error:', err.message);
+    console.error(`TCP ${aggregationType} socket error:`, err.message);
   });
-});
+}
 
-// Start TCP server for Netdata (port 8080) and HTTP server for other clients (port 8081) (data-generator and helth check)
-const httpPort = 8081;
-
-tcpServer.listen(port, '0.0.0.0', () => {
-  console.log(`[${new Date().toISOString()}] TCP server listening on port ${port} for raw Netdata connections`);
-});
-
-app.listen(httpPort, '0.0.0.0', () => {
-  console.log(`[${new Date().toISOString()}] HTTP server listening on port ${httpPort} for data generator and health checks`);
+// Start HTTP server on port 8080 for HTTP endpoints, data generator and health checks
+app.listen(port, '0.0.0.0', () => {
+  console.log(`[${new Date().toISOString()}] HTTP server listening on port ${port} for Netdata HTTP endpoints, data generator and health checks`);
   console.log('Environment:', {
     CLICKHOUSE_HOST: process.env.CLICKHOUSE_HOST,
     CLICKHOUSE_PORT: process.env.CLICKHOUSE_PORT,
     CLICKHOUSE_USER: process.env.CLICKHOUSE_USER,
     CLICKHOUSE_DATABASE: process.env.CLICKHOUSE_DATABASE
   });
+});
+
+// Start TCP server for average data on port 8081
+const tcpAvgPort = 8081;
+tcpServerAvg.listen(tcpAvgPort, '0.0.0.0', () => {
+  console.log(`[${new Date().toISOString()}] TCP server listening on port ${tcpAvgPort} for AVERAGE Netdata connections`);
+});
+
+// Start TCP server for maximum data on port 8082
+const tcpMaxPort = 8082;
+tcpServerMax.listen(tcpMaxPort, '0.0.0.0', () => {
+  console.log(`[${new Date().toISOString()}] TCP server listening on port ${tcpMaxPort} for MAXIMUM Netdata connections`);
 });
 
 // Graceful shutdown

@@ -8,7 +8,8 @@ CREATE TABLE IF NOT EXISTS netdata_metrics.metrics (
     units LowCardinality(String),
     family LowCardinality(String),
     context LowCardinality(String),
-    chart_type LowCardinality(String)
+    chart_type LowCardinality(String),
+    aggregation_type LowCardinality(String) DEFAULT ''
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (hostname, chart_id, dimension, timestamp)
