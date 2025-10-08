@@ -1,1 +1,0 @@
-ALTER TABLE netdata_metrics.metrics ADD INDEX IF NOT EXISTS idx_chart_id chart_id TYPE bloom_filter(0.01) GRANULARITY 1;

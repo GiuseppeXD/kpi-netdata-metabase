@@ -1,332 +1,100 @@
-# ClickHouse Monitoring Stack Test Environment
+# Netdata to GraphQL Exporter
 
-A monitoring stack that integrates **Netdata** with **ClickHouse** for time-series metrics storage and **Metabase** for data visualization. This project provides both synthetic data generation for testing and real production data ingestion from Netdata parent-child setups.
+This repository contains a minimal toolchain to pull metrics from a Netdata API that is exposed locally (for example via an SSH tunnel on `localhost:19999`) and forward the data to a GraphQL API. The stack is intentionally small: a Node.js proxy converts Netdata JSON payloads into GraphQL mutations and a Python forwarder polls Netdata on a schedule.
 
-## 🏗️ Architecture
+## Components
 
-```
-Netdata Parent/Children → Custom Proxy → ClickHouse → Metabase
-                ↓
-         SSH Tunnel (optional)
-                ↓
-        Python Forwarder → Custom Proxy
-```
+- **GraphQL proxy** (`netdata-proxy-graphql/`)
+  - Receives Netdata JSON payloads (HTTP or JSONL over TCP)
+  - Converts metrics into GraphQL `createRecord` mutations and batches them per request
+  - Requires a GraphQL endpoint, sheet ID, and API key
+- **Forwarder** (`netdata-forwarder.py`)
+  - Polls the Netdata API for a selectable list of charts and aggregations
+  - Sends batches to the proxy (`/avg`, `/max`, `/median` endpoints)
+  - Designed to talk to a Netdata instance on `localhost:19999`
+- **Docker Compose** (`docker-compose.yml`)
+  - Builds and runs the proxy
+  - Launches the Python forwarder with configurable environment variables
 
-### Data Flow
-1. **Netdata Parent** aggregates metrics from child nodes via streaming
-2. **Netdata Forwarder** (Python script) pulls metrics via API and forwards to proxy
-3. **Custom Proxy** (Node.js) converts Netdata JSON to ClickHouse format
-4. **ClickHouse** stores time-series data with automatic partitioning and TTL
-5. **Metabase** provides dashboards and visualization
+## Prerequisites
 
-## 🔧 Components
-
-### Core Services
-- **ClickHouse**: Time-series database with optimized storage
-- **Netdata Proxy**: Express.js service for format conversion
-- **Netdata Forwarder**: Python script for API data extraction
-- **Metabase**: Dashboard and visualization platform
-- **PostgreSQL**: Metabase metadata storage
-
-### Optional Test Components
-- **Data Generator**: Python script for synthetic metrics
-- **Local Netdata**: Containerized Netdata for testing
-
-## 🚀 Quick Start
-
-### Prerequisites
 - Docker and Docker Compose
-- Python 3.8+
-- SSH access to Netdata parent server (for production data)
+- A Netdata instance reachable at `http://localhost:19999` (commonly exposed via `ssh -L 19999:localhost:19999 user@host`)
+- A GraphQL API key with permission to insert records
 
-### 1. Start Core Infrastructure
+## Getting Started
 
-```bash
-# Clone or navigate to project directory
-cd clickhouse-test
+1. Copy the environment template and fill in your credentials:
+   ```bash
+   cp .env.example .env
+   # edit .env to set API_KEY and optional overrides
+   ```
 
-# Start ClickHouse and Proxy
-docker-compose up -d clickhouse netdata-proxy
+2. Establish the SSH tunnel (if needed):
+   ```bash
+   ssh -L 19999:localhost:19999 user@your-netdata-host
+   ```
 
-# Verify services
-docker-compose ps
-curl http://localhost:8081/health  # Proxy health check
-```
+3. Start the stack:
+   ```bash
+   docker-compose up -d
+   ```
 
-### 2. Initialize Database Schema
+4. Check service health:
+   ```bash
+   docker-compose ps
+   curl http://localhost:8090/health       # GraphQL proxy status
+   docker-compose logs -f netdata-forwarder
+   ```
 
-```bash
-# Run the database setup script
-./setup_clickhouse_init.sh
+The forwarder polls Netdata every 60 seconds by default and pushes metrics to the proxy, which then writes them to the configured GraphQL endpoint.
 
-# Verify tables were created
-docker exec clickhouse-test clickhouse-client --query "SHOW TABLES FROM netdata_metrics"
-```
+## Configuration
 
-### 3. Choose Data Source
+All runtime settings can be supplied through `.env` or the shell. Key variables:
 
-#### Option A: Real Production Data (Recommended)
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `API_KEY` | GraphQL API authentication token (required) | — |
+| `GRAPHQL_ENDPOINT` | GraphQL endpoint URL | `https://digitalize.oxeanbits.com/graphql` |
+| `SHEET_ID` | Target sheet ID for record creation | `68bf175e85d08f78bf97b15f` |
+| `NETDATA_URL` | Netdata base URL | `http://host.docker.internal:19999` |
+| `GRAPHQL_PROXY_URL` | Proxy URL used by the forwarder | `http://netdata-graphql-proxy:8090` |
+| `CHARTS` | Comma-separated Netdata chart IDs to query | `system.cpu,disk_space./` |
+| `AGGREGATION_TYPES` | Comma-separated aggregations (`average`, `median`, `max`) | `average,median,max` |
+| `NETDATA_HOSTS` | Optional list of mirrored hostnames to poll | _(auto-detected)_ |
+| `INTERVAL_SECONDS` | Polling interval | `60` |
+| `REQUEST_TIMEOUT` | HTTP timeout for Netdata/proxy calls | `120` secs |
+| `FORWARDER_LOG_LEVEL` | Forwarder log level | `INFO` |
+| `GRAPHQL_BATCH_SIZE` | Metrics per GraphQL mutation batch | `20` |
 
-```bash
-# 1. Setup SSH tunnel to your Netdata parent server
-ssh -L 19999:localhost:19999 user@your-netdata-server
+When running in Docker the forwarder resolves the host machine via `host.docker.internal`. If your Docker version does not support this alias, override `NETDATA_URL` with the appropriate address (for example `http://172.17.0.1:19999`).
 
-# 2. Install Python dependencies (if needed)
-pip3 install requests
+## Running the Forwarder Manually
 
-# 3. Run the forwarder (pulls from real Netdata via tunnel)
-python3 netdata-forwarder.py
-
-# 4. Check data is flowing
-./check-data.sh
-```
-
-#### Option B: Synthetic Test Data
-
-```bash
-# Start data generator
-docker-compose up -d data-generator
-
-# Monitor logs
-docker-compose logs -f data-generator
-```
-
-### 4. Setup Metabase (Optional)
+You can execute the forwarder outside Docker for testing:
 
 ```bash
-# Start Metabase
-docker-compose up -d metabase postgres
-
-# Access Metabase
-open http://localhost:3000
-
-# Configure ClickHouse connection:
-# Host: clickhouse
-# Port: 8123
-# Database: netdata_metrics
-# Username: netdata
-# Password: netdata123
+python3 netdata-forwarder.py --once   # single poll
+python3 netdata-forwarder.py          # continuous mode
 ```
 
-## 📊 Database Schema
+Export the same environment variables used in `.env` so the script can reach Netdata and the proxy.
 
-### Main Metrics Table
-```sql
-CREATE TABLE metrics (
-    timestamp DateTime64(3),
-    hostname LowCardinality(String),
-    chart_id LowCardinality(String),
-    chart_name String,
-    dimension LowCardinality(String),
-    value Float64,
-    units String,
-    family String,
-    context String,
-    chart_type String
-) ENGINE = MergeTree()
-PARTITION BY toYYYYMM(timestamp)
-ORDER BY (hostname, chart_id, dimension, timestamp)
-TTL timestamp + INTERVAL 30 DAY;
-```
+## Observability
 
-### Hourly Aggregation
-- Automatic rollups via materialized views
-- 1-year retention for aggregated data
-- Optimized for dashboard queries
+- Proxy logs: `docker-compose logs -f netdata-graphql-proxy`
+- Forwarder metrics: `docker-compose logs -f netdata-forwarder`
+- Health endpoint: `curl http://localhost:8090/health`
+- Test GraphQL connectivity: `curl http://localhost:8090/test`
 
-## 🔍 Data Verification
-
-### Check Data Ingestion
-```bash
-# View summary
-./check-data.sh
-
-# Manual queries
-docker exec clickhouse-test clickhouse-client --query "
-    SELECT hostname, count() as metrics, uniq(chart_id) as charts 
-    FROM netdata_metrics.metrics 
-    GROUP BY hostname 
-    ORDER BY metrics DESC
-"
-```
-
-### Common Queries
-```sql
--- Recent disk usage by host
-SELECT 
-    hostname, 
-    chart_id, 
-    dimension, 
-    value, 
-    units
-FROM netdata_metrics.metrics 
-WHERE chart_id LIKE '%disk_space%' 
-AND timestamp > now() - INTERVAL 1 HOUR
-ORDER BY timestamp DESC;
-
--- CPU usage trends
-SELECT 
-    toStartOfHour(timestamp) as hour,
-    hostname,
-    avg(value) as avg_cpu
-FROM netdata_metrics.metrics 
-WHERE chart_id = 'system.cpu' 
-AND dimension = 'user'
-GROUP BY hour, hostname
-ORDER BY hour DESC;
-```
-
-## 🛠️ Configuration
-
-### Environment Variables
-Set in `docker-compose.yml`:
-
-```yaml
-# ClickHouse Connection
-CLICKHOUSE_HOST: clickhouse
-CLICKHOUSE_PORT: 8123
-CLICKHOUSE_DATABASE: netdata_metrics
-CLICKHOUSE_USER: netdata
-CLICKHOUSE_PASSWORD: netdata123
-
-# Forwarder Settings
-NETDATA_URL: http://localhost:19999
-PROXY_URL: http://localhost:8081
-INTERVAL_SECONDS: 30
-```
-
-### Netdata Forwarder Configuration
-Edit `netdata-forwarder.py`:
-```python
-NETDATA_URL = "http://localhost:19999"  # SSH tunneled endpoint
-PROXY_URL = "http://localhost:8081"     # Local proxy
-INTERVAL_SECONDS = 30                   # Collection frequency
-```
-
-## 📋 Production Setup
-
-### 1. Netdata Parent-Child Configuration
-On child nodes (`stream.conf`):
-```ini
-[stream]
-enabled = yes
-destination = PARENT_IP:19999
-api key = YOUR_API_KEY
-```
-
-On parent node (`stream.conf`):
-```ini
-[YOUR_API_KEY]
-enabled = yes
-default history = 3600
-default memory mode = save
-health enabled = yes
-```
-
-### 2. SSH Tunnel for Secure Access
-```bash
-# Setup persistent tunnel
-ssh -f -N -L 19999:localhost:19999 user@netdata-parent-server
-
-# Or use autossh for reliability
-autossh -f -N -L 19999:localhost:19999 user@netdata-parent-server
-```
-
-### 3. Systemd Service (Optional)
-Create `/etc/systemd/system/netdata-forwarder.service`:
-```ini
-[Unit]
-Description=Netdata to ClickHouse Forwarder
-After=network.target
-
-[Service]
-Type=simple
-User=netdata
-WorkingDirectory=/path/to/clickhouse-test
-ExecStart=/usr/bin/python3 netdata-forwarder.py
-Restart=always
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-```
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-**Forwarder not collecting data:**
-```bash
-# Check Netdata API accessibility
-curl http://localhost:19999/api/v1/info
-
-# Test individual host endpoint
-curl "http://localhost:19999/host/HOSTNAME/api/v1/allmetrics?format=json"
-
-# Check proxy health
-curl http://localhost:8081/health
-```
-
-**Database connection errors:**
-```bash
-# Verify ClickHouse is running
-docker exec clickhouse-test clickhouse-client --query "SELECT 1"
-
-# Check table exists
-docker exec clickhouse-test clickhouse-client --query "SHOW TABLES FROM netdata_metrics"
-```
-
-**Dimension name issues:**
-- Ensure forwarder sends `id` field, not `dimension`
-- Check proxy processes metrics correctly
-- Verify chart IDs match expected format
-
-### Logs and Monitoring
-```bash
-# Proxy logs
-docker-compose logs -f netdata-proxy
-
-# ClickHouse logs  
-docker-compose logs -f clickhouse
-
-# Forwarder logs (when run manually)
-python3 netdata-forwarder.py --once  # Single run for testing
-```
-
-## 🎯 Use Cases
-
-- **Production Monitoring**: Real-time metrics from distributed Netdata setup
-- **Performance Testing**: Synthetic load generation for ClickHouse optimization
-- **Dashboard Development**: Metabase dashboard creation and testing
-- **Data Engineering**: Time-series data pipeline development
-- **Alerting**: Custom alert rule development and testing
-
-## 📁 Project Structure
+## File Layout
 
 ```
-├── README.md                    # This file
-├── CLAUDE.md                   # Claude Code project instructions
-├── docker-compose.yml          # Container orchestration
-├── setup_clickhouse_init.sh    # Database initialization
-├── netdata-proxy/              # Node.js format converter
-│   ├── app.js
-│   └── package.json
-├── data-generator/             # Python synthetic data generator
-│   ├── generator.py
-│   └── requirements.txt
-├── netdata-forwarder.py        # Real data collector
-├── netdata-forwarder.sh        # Bash alternative
-├── check-data.sh              # Data verification script
-└── diagnose-disk-issue.py     # Diagnostic utilities
+netdata-proxy-graphql/   # Node.js proxy source and Dockerfile
+netdata-forwarder.py     # Netdata polling script
+docker-compose.yml      # Service definitions
+.env.example             # Configuration template
 ```
 
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Test with both synthetic and real data
-4. Submit a pull request
-
-## 📜 License
-
-This project is provided as-is for monitoring and testing purposes.
+This repository deliberately excludes legacy ClickHouse/Metabase assets to focus solely on exporting Netdata metrics to the GraphQL API.

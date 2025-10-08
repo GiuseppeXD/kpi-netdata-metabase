@@ -1,7 +1,8 @@
-# Netdata config files (keep only exporting.conf and netdata.conf)
-netdata-config/*
-!netdata-config/exporting.conf
-!netdata-config/netdata.conf
+# Environment files
+.env
 
-# Node.js dependencies
-netdata-proxy/node_modules
+# Python cache
+__pycache__/
+
+# Node.js dependencies (if installed locally)
+netdata-proxy-graphql/node_modules

@@ -1,545 +1,294 @@
 #!/usr/bin/env python3
+"""Netdata to GraphQL forwarder.
+
+This script polls a Netdata instance exposed locally (for example through
+an SSH tunnel) and forwards selected metrics to the GraphQL proxy service.
 """
-Netdata Metrics Forwarder
-Pulls metrics from SSH-tunneled Netdata API and forwards to netdata-proxy
-"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+import time
+from typing import Any, Dict, Iterable, List, Optional
 
 import requests
-import json
-import time
-import sys
-from datetime import datetime
-import logging
 
-# Configuration
-NETDATA_URL = "http://localhost:19999"  # SSH tunneled Netdata API on host
-NETDATA_LOCAL_URL = "http://localhost:19998"  # Local netdata-parent container
-PROXY_URL = "http://localhost:8080"     # netdata-proxy HTTP endpoint (host network)
-GRAPHQL_PROXY_URL = "http://localhost:8090"  # GraphQL proxy HTTP endpoint (host network)
-INTERVAL_SECONDS = 60                   # How often to pull metrics (must match aggregation window)
-MAX_RETRIES = 3
-
-# Specific charts to collect
-CHARTS_TO_COLLECT = [
-    'system.cpu',      # CPU usage
-    'disk_space./'     # Root disk usage
-]
-
-# Aggregation types to collect
-AGGREGATION_TYPES = ['max', 'average', 'median']
-
-# Time window for aggregations (in seconds, negative for "last X seconds")
-TIME_WINDOW = -60
-
-# Setup logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=LOG_LEVEL,
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-class NetdataForwarder:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.timeout = 10
+AGGREGATION_SETTINGS = {
+    "average": {"group": "average", "endpoint": "avg", "label": "AVG"},
+    "avg": {"group": "average", "endpoint": "avg", "label": "AVG"},
+    "max": {"group": "max", "endpoint": "max", "label": "MAX"},
+    "maximum": {"group": "max", "endpoint": "max", "label": "MAX"},
+    "median": {"group": "median", "endpoint": "median", "label": "MEDIAN"},
+}
 
-    def get_netdata_info(self):
-        """Get Netdata node information"""
-        try:
-            response = self.session.get(f"{NETDATA_URL}/api/v1/info")
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"Failed to get Netdata info: {e}")
-            return None
 
-    def get_netdata_metrics(self):
-        """Pull all metrics from Netdata API"""
-        try:
-            url = f"{NETDATA_URL}/api/v1/allmetrics?format=json"
-            response = self.session.get(url)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch Netdata metrics: {e}")
-            return None
+class Config:
+    """Runtime configuration read from environment variables."""
 
-    def get_chart_data(self, hostname, chart_id, aggregation_type, base_netdata_url):
-        """Get aggregated data for a specific chart from a specific mirrored host"""
-        try:
-            # Build URL for host-specific chart data with aggregation
-            base_url = f"{base_netdata_url}/host/{hostname}/api/v1/data"
-                
-            params = {
-                'chart': chart_id,
-                'group': aggregation_type,
-                'after': TIME_WINDOW,
-                'points': 1,  # Get single aggregated point
-                'format': 'json'
-            }
-            
-            response = self.session.get(base_url, params=params)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.warning(f"Failed to get {aggregation_type} data for {chart_id} from {hostname}: {response.status_code}")
-                return None
-                
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"Error fetching {aggregation_type} data for {chart_id} from {hostname}: {e}")
-            return None
+    def __init__(self) -> None:
+        self.netdata_url = os.getenv("NETDATA_URL", "http://localhost:19999").rstrip("/")
+        self.graphql_proxy_url = os.getenv("GRAPHQL_PROXY_URL", "http://localhost:8090").rstrip("/")
+        self.interval_seconds = int(os.getenv("INTERVAL_SECONDS", "60"))
+        self.request_timeout = int(os.getenv("REQUEST_TIMEOUT", "120"))
+        self.skip_tls_verify = os.getenv("NETDATA_SKIP_TLS_VERIFY", "false").lower() == "true"
+        self.netdata_hosts = self._split_list(os.getenv("NETDATA_HOSTS", ""))
+        self.chart_ids = [
+            chart_id
+            for chart_id in self._split_list(os.getenv("CHARTS", "system.cpu,disk_space./"))
+            if "disk_space" in chart_id
+        ]
+        if not self.chart_ids:
+            # Ensure we always collect at least the root disk when filtering.
+            self.chart_ids = ["disk_space./"]
+        self.aggregations = self._parse_aggregations(os.getenv("AGGREGATION_TYPES", "average,median,max"))
 
-    def get_chart_data_direct(self, chart_id, aggregation_type, netdata_url):
-        """Get aggregated data directly from a Netdata instance (not host-specific)"""
-        try:
-            # Build URL for direct chart data with aggregation
-            base_url = f"{netdata_url}/api/v1/data"
-                
-            params = {
-                'chart': chart_id,
-                'group': aggregation_type,
-                'after': TIME_WINDOW,
-                'points': 1,  # Get single aggregated point
-                'format': 'json'
-            }
-            
-            response = self.session.get(base_url, params=params)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.warning(f"Failed to get {aggregation_type} data for {chart_id} from {netdata_url}: {response.status_code}")
-                return None
-                
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"Error fetching {aggregation_type} data for {chart_id} from {netdata_url}: {e}")
-            return None
+    @staticmethod
+    def _split_list(raw: str) -> List[str]:
+        return [item.strip() for item in raw.split(",") if item.strip()]
 
-    def get_metrics_for_all_hosts(self):
-        """Get aggregated metrics from both mirrored hosts and local container"""
-        all_metrics = []
-        
-        # 1. Collect from mirrored hosts via SSH tunnel (remote)
-        logger.info("Collecting from mirrored hosts via SSH tunnel...")
-        mirrored_metrics = self.get_mirrored_host_metrics()
-        all_metrics.extend(mirrored_metrics)
-        
-        # 2. Collect from local netdata-parent container (DISABLED)
-        # logger.info("Collecting from local netdata-parent container...")
-        # local_metrics = self.get_local_host_metrics()
-        # all_metrics.extend(local_metrics)
-        
-        logger.info(f"Collected {len(all_metrics)} total metrics from all sources")
-        return all_metrics
-
-    def get_mirrored_host_metrics(self):
-        """Get metrics from mirrored hosts via SSH tunnel"""
-        all_metrics = []
-        
-        # Get info about available mirrored hosts
-        info = self.get_netdata_info()
-        if not info:
-            logger.warning("Could not get Netdata info from SSH tunnel - skipping mirrored hosts")
-            return []
-            
-        # Get list of mirrored hosts (children streaming to this parent)
-        mirrored_hosts = info.get('mirrored_hosts', [])
-        if not mirrored_hosts:
-            logger.warning("No mirrored hosts found - no child nodes are streaming to this parent")
-            return []
-            
-        logger.info(f"Found {len(mirrored_hosts)} mirrored hosts: {', '.join(mirrored_hosts)}")
-        
-        # Collect metrics for each mirrored host
-        for hostname in mirrored_hosts:
-            host_metrics_collected = 0
-            for chart_id in CHARTS_TO_COLLECT:
-                for aggregation_type in AGGREGATION_TYPES:
-                    try:
-                        chart_data = self.get_chart_data(hostname, chart_id, aggregation_type, NETDATA_URL)
-                        if chart_data:
-                            metrics = self.parse_chart_response(chart_data, hostname, chart_id, aggregation_type)
-                            all_metrics.extend(metrics)
-                            host_metrics_collected += len(metrics)
-                        else:
-                            logger.debug(f"No data for {chart_id} ({aggregation_type}) from {hostname}")
-                    except Exception as e:
-                        logger.warning(f"Failed to collect {chart_id} ({aggregation_type}) from {hostname}: {e}")
-                        continue
-                        
-            if host_metrics_collected > 0:
-                logger.info(f"Collected {host_metrics_collected} metrics from mirrored host {hostname}")
-            else:
-                logger.warning(f"No metrics collected from mirrored host {hostname}")
-                
-        return all_metrics
-
-    def get_local_host_metrics(self):
-        """Get metrics from local netdata-parent container"""
-        all_metrics = []
-        local_hostname = "netdata-parent-test"  # Container hostname
-        
-        host_metrics_collected = 0
-        for chart_id in CHARTS_TO_COLLECT:
-            for aggregation_type in AGGREGATION_TYPES:
-                try:
-                    chart_data = self.get_chart_data_direct(chart_id, aggregation_type, NETDATA_LOCAL_URL)
-                    if chart_data:
-                        metrics = self.parse_chart_response(chart_data, local_hostname, chart_id, aggregation_type)
-                        all_metrics.extend(metrics)
-                        host_metrics_collected += len(metrics)
-                    else:
-                        logger.debug(f"No data for {chart_id} ({aggregation_type}) from local container")
-                except Exception as e:
-                    logger.warning(f"Failed to collect {chart_id} ({aggregation_type}) from local container: {e}")
-                    continue
-                    
-        if host_metrics_collected > 0:
-            logger.info(f"Collected {host_metrics_collected} metrics from local container")
-        else:
-            logger.warning(f"No metrics collected from local container")
-            
-        return all_metrics
-
-    def parse_chart_response(self, chart_data, hostname, chart_id, aggregation_type):
-        """Parse Netdata /api/v1/data response into individual metrics"""
-        metrics = []
-        
-        if not chart_data or not isinstance(chart_data, dict):
-            return metrics
-            
-        # Get labels and data from actual API response format
-        labels = chart_data.get('labels', [])
-        data_points = chart_data.get('data', [])
-        
-        if not labels or not data_points:
-            logger.warning(f"No data found for {chart_id} from {hostname} ({aggregation_type})")
-            return metrics
-            
-        # First label is "time", rest are dimension names
-        if len(labels) < 2:
-            logger.warning(f"Invalid labels format for {chart_id} from {hostname} ({aggregation_type})")
-            return metrics
-            
-        dimensions = labels[1:]  # Skip "time" label
-        
-        # Use the first (and should be only) data point since we requested points=1
-        if len(data_points) > 0 and len(data_points[0]) > 1:
-            timestamp = data_points[0][0] if len(data_points[0]) > 0 else int(time.time())
-            values = data_points[0][1:] if len(data_points[0]) > 1 else []
-            
-            # Create metric for each dimension
-            for i, dimension in enumerate(dimensions):
-                if i < len(values) and values[i] is not None:
-                    try:
-                        value = float(values[i])
-                        
-                        metric = {
-                            'timestamp': timestamp,
-                            'hostname': hostname,
-                            'chart_id': chart_id,
-                            'chart_name': chart_id.replace('_', ' ').title(),  # Generate readable name
-                            'id': dimension,  # proxy expects 'id' not 'dimension'
-                            'value': value,
-                            'units': self._get_chart_units(chart_id),  # Helper method for units
-                            'family': chart_id.split('.')[0] if '.' in chart_id else '',
-                            'context': chart_id,
-                            'chart_type': 'line',
-                            '_aggregation_type': aggregation_type  # Track aggregation type
-                        }
-                        metrics.append(metric)
-                        
-                    except (ValueError, TypeError) as e:
-                        logger.warning(f"Invalid value for {dimension} in {chart_id}: {values[i]}")
-                        
-        return metrics
-
-    def _get_chart_units(self, chart_id):
-        """Get appropriate units for common chart types"""
-        if 'cpu' in chart_id.lower():
-            return 'percentage'
-        elif 'disk_space' in chart_id.lower():
-            return 'GB'
-        elif 'memory' in chart_id.lower():
-            return 'MB'
-        else:
-            return ''
-
-    def transform_metrics(self, all_host_data):
-        """Transform Netdata API format to netdata-proxy format"""
-        metrics = []
-        
-        # Handle different possible formats from Netdata API
-        if not all_host_data:
-            return metrics
-        
-        # Process data for each host
-        for hostname, host_data in all_host_data.items():
-            if not isinstance(host_data, dict):
+    def _parse_aggregations(self, raw: str) -> List[str]:
+        parsed: List[str] = []
+        for item in self._split_list(raw):
+            key = item.lower()
+            if key not in AGGREGATION_SETTINGS:
+                logger.warning("Unsupported aggregation '%s' - skipping", item)
                 continue
-                
-            # Process charts for this host
-            for chart_id, chart_data in host_data.items():
-                if not isinstance(chart_data, dict):
-                    continue
-                    
-                # Extract chart metadata
-                chart_name = chart_data.get('name', chart_id)
-                chart_type = chart_data.get('chart_type', 'line')  
-                units = chart_data.get('units', '')
-                family = chart_data.get('family', '')
-                context = chart_data.get('context', chart_id)
-                
-                # Use Netdata's actual timestamp, not current time
-                chart_timestamp = chart_data.get('last_updated')
-                if chart_timestamp:
-                    # Netdata provides Unix timestamp, convert to seconds
-                    metric_timestamp = int(chart_timestamp)
-                else:
-                    # Fallback to current time if no timestamp available
-                    metric_timestamp = int(time.time())
-                
-                # Use hostname from structure, or override if chart has _hostname tag
-                actual_hostname = chart_data.get('_hostname', hostname)
-                    
-                # Extract dimensions (actual metric values)
-                dimensions = chart_data.get('dimensions', {})
-                if not dimensions:
-                    continue
-                    
-                for dimension_id, dimension_data in dimensions.items():
-                    if not isinstance(dimension_data, dict):
-                        continue
-                        
-                    value = dimension_data.get('value')
-                    if value is None:
-                        continue
-                        
-                    try:
-                        value = float(value)
-                    except (ValueError, TypeError):
-                        continue
-                    
-                    # Create metric in format expected by netdata-proxy
-                    # The proxy expects 'id' field for dimension name (see processNetdataMetric)
-                    metric = {
-                        'timestamp': metric_timestamp,
-                        'hostname': actual_hostname,
-                        'chart_id': chart_id,
-                        'chart_name': chart_name,
-                        'id': dimension_id,  # proxy expects 'id' not 'dimension' 
-                        'value': value,
-                        'units': units,
-                        'family': family,
-                        'context': context,
-                        'chart_type': chart_type
-                    }
-                    metrics.append(metric)
-        
+            canonical = AGGREGATION_SETTINGS[key]["group"]
+            if canonical not in parsed:
+                parsed.append(canonical)
+        if not parsed:
+            parsed.append("average")
+        return parsed
+
+
+class NetdataForwarder:
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.session = requests.Session()
+        self.session.verify = not config.skip_tls_verify
+
+    def get_netdata_info(self) -> Optional[Dict[str, Any]]:
+        try:
+            response = self.session.get(
+                f"{self.config.netdata_url}/api/v1/info",
+                timeout=self.config.request_timeout,
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as exc:
+            logger.warning("Unable to fetch Netdata info: %s", exc)
+            return None
+
+    def get_chart_data(self, hostname: str, chart_id: str, aggregation: str) -> Optional[Dict[str, Any]]:
+        params = {
+            "chart": chart_id,
+            "group": aggregation,
+            "after": -self.config.interval_seconds,
+            "points": 1,
+            "format": "json",
+        }
+        try:
+            if hostname:
+                url = f"{self.config.netdata_url}/host/{hostname}/api/v1/data"
+            else:
+                url = f"{self.config.netdata_url}/api/v1/data"
+            response = self.session.get(url, params=params, timeout=self.config.request_timeout)
+            if response.status_code == 404 and hostname:
+                logger.warning("Host '%s' not found for chart '%s'", hostname, chart_id)
+                return None
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as exc:
+            logger.warning(
+                "Failed to get %s aggregation for %s (host=%s): %s",
+                aggregation,
+                chart_id,
+                hostname or "self",
+                exc,
+            )
+            return None
+
+    def parse_chart_response(
+        self,
+        payload: Dict[str, Any],
+        hostname: str,
+        chart_id: str,
+        aggregation: str,
+    ) -> List[Dict[str, Any]]:
+        metrics: List[Dict[str, Any]] = []
+        labels = payload.get("labels") or []
+        data_points = payload.get("data") or []
+        if len(labels) < 2 or not data_points:
+            return metrics
+
+        timestamp = int(data_points[0][0]) if data_points[0] else int(time.time())
+        values = data_points[0][1:]
+        dimensions = labels[1:]
+
+        for dimension, value in zip(dimensions, values):
+            if value is None:
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            metric = {
+                "timestamp": timestamp,
+                "hostname": hostname,
+                "chart_id": chart_id,
+                "chart_name": chart_id.replace("_", " ").title(),
+                "id": dimension,
+                "value": numeric,
+                "units": self._guess_units(chart_id),
+                "context": chart_id,
+                "chart_type": "line",
+                "aggregation": aggregation,
+            }
+            metrics.append(metric)
         return metrics
 
-    def send_to_proxy(self, metrics, aggregation_type='average'):
-        """Send transformed metrics to netdata-proxy with specified aggregation type"""
-        if not metrics:
-            logger.warning("No metrics to send")
-            return False
-            
-        try:
-            # Choose endpoint based on aggregation type
-            if aggregation_type == 'max':
-                endpoint = f"{PROXY_URL}/max"
-            elif aggregation_type == 'average':
-                endpoint = f"{PROXY_URL}/avg"  
-            elif aggregation_type == 'median':
-                endpoint = f"{PROXY_URL}/median"  # Will add this endpoint to proxy
-            else:
-                endpoint = PROXY_URL  # Default endpoint (defaults to average)
-            
-            # Send as JSON array (format supported by netdata-proxy)
-            response = self.session.post(
-                endpoint,
-                json=metrics,
-                headers={'Content-Type': 'application/json'}
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            logger.info(f"Successfully sent {len(metrics)} {aggregation_type} metrics to ClickHouse proxy. "
-                       f"Proxy response: {result.get('status')} - "
-                       f"{result.get('rows_inserted', 0)} rows inserted in "
-                       f"{result.get('processing_time', 0)}ms")
-            return True
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to send {aggregation_type} metrics to ClickHouse proxy: {e}")
-            return False
+    @staticmethod
+    def _guess_units(chart_id: str) -> str:
+        lowered = chart_id.lower()
+        if "cpu" in lowered:
+            return "percentage"
+        if "disk" in lowered:
+            return "GB"
+        if "memory" in lowered:
+            return "MB"
+        return ""
 
-    def send_to_graphql_proxy(self, metrics, aggregation_type='average'):
-        """Send transformed metrics to GraphQL proxy with specified aggregation type"""
-        if not metrics:
-            logger.warning("No metrics to send to GraphQL proxy")
-            return False
-            
-        try:
-            # Choose endpoint based on aggregation type
-            if aggregation_type == 'max':
-                endpoint = f"{GRAPHQL_PROXY_URL}/max"
-            elif aggregation_type == 'average':
-                endpoint = f"{GRAPHQL_PROXY_URL}/avg"  
-            elif aggregation_type == 'median':
-                endpoint = f"{GRAPHQL_PROXY_URL}/median"
-            else:
-                endpoint = GRAPHQL_PROXY_URL  # Default endpoint (defaults to average)
-            
-            # Send as JSON array (format supported by GraphQL proxy)
-            response = self.session.post(
-                endpoint,
-                json=metrics,
-                headers={'Content-Type': 'application/json'}
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            logger.info(f"Successfully sent {len(metrics)} {aggregation_type} metrics to GraphQL proxy. "
-                       f"Proxy response: {result.get('status')} - "
-                       f"{result.get('records_sent', 0)} records sent in "
-                       f"{result.get('processing_time', 0)}ms")
-            return True
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to send {aggregation_type} metrics to GraphQL proxy: {e}")
-            return False
+    def collect_metrics(self) -> List[Dict[str, Any]]:
+        info = self.get_netdata_info()
+        default_hostname = info.get("hostname") if isinstance(info, dict) else "netdata"
+        mirrored_hosts = info.get("mirrored_hosts", []) if isinstance(info, dict) else []
 
-    def health_check(self):
-        """Check if Netdata and both proxies are accessible"""
-        try:
-            # Check Netdata API
-            netdata_response = self.session.get(f"{NETDATA_URL}/api/v1/info")
-            netdata_response.raise_for_status()
-            logger.info(f"Netdata API accessible - Version: {netdata_response.json().get('version', 'unknown')}")
-            
-            # Check ClickHouse proxy health
-            proxy_response = self.session.get(f"{PROXY_URL}/health")
-            proxy_response.raise_for_status()
-            logger.info(f"ClickHouse proxy accessible - Status: {proxy_response.json().get('status')}")
-            
-            # Check GraphQL proxy health
-            graphql_proxy_response = self.session.get(f"{GRAPHQL_PROXY_URL}/health")
-            graphql_proxy_response.raise_for_status()
-            graphql_status = graphql_proxy_response.json()
-            logger.info(f"GraphQL proxy accessible - Status: {graphql_status.get('status')}, Auth: {graphql_status.get('auth_configured')}")
-            
-            return True
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Health check failed: {e}")
-            return False
-
-    def run_once(self):
-        """Pull metrics once and forward to proxy"""
-        logger.info("Pulling aggregated metrics from mirrored hosts...")
-        
-        # Get metrics directly as list (already aggregated by type)
-        metrics_by_aggregation = {}
-        all_host_data = self.get_metrics_for_all_hosts()
-        
-        if not all_host_data:
-            logger.error("No data received from mirrored hosts")
-            return False
-            
-        # Group metrics by aggregation type for separate sending
-        for metric in all_host_data:
-            # We need to extract aggregation type from our collection process
-            # Since we collected each metric with specific aggregation, we need to group them
-            pass
-            
-        # Since we're now collecting pre-aggregated data, send directly
-        logger.info(f"Collected {len(all_host_data)} pre-aggregated metrics")
-        
-        if not all_host_data:
-            logger.warning("No valid metrics collected")
-            return False
-            
-        # Group metrics by aggregation type and send to both proxies
-        # Send available data even if some aggregation types are missing
-        total_sent_clickhouse = 0
-        total_sent_graphql = 0
-        failed_sends = 0
-        
-        for aggregation_type in AGGREGATION_TYPES:
-            # Filter metrics for this aggregation type
-            type_metrics = [m for m in all_host_data if m.get('_aggregation_type') == aggregation_type]
-            if type_metrics:
-                # Remove the internal aggregation marker before sending
-                clean_metrics = []
-                for metric in type_metrics:
-                    clean_metric = {k: v for k, v in metric.items() if k != '_aggregation_type'}
-                    clean_metrics.append(clean_metric)
-                
-                # Send to ClickHouse proxy
-                try:
-                    clickhouse_success = self.send_to_proxy(clean_metrics, aggregation_type)
-                    if clickhouse_success:
-                        total_sent_clickhouse += len(clean_metrics)
-                        logger.info(f"Successfully sent {len(clean_metrics)} metrics with {aggregation_type} aggregation to ClickHouse")
-                    else:
-                        failed_sends += 1
-                        logger.error(f"Failed to send {len(clean_metrics)} metrics with {aggregation_type} aggregation to ClickHouse")
-                except Exception as e:
-                    failed_sends += 1
-                    logger.error(f"Exception sending {aggregation_type} metrics to ClickHouse: {e}")
-                
-                # Send to GraphQL proxy
-                try:
-                    graphql_success = self.send_to_graphql_proxy(clean_metrics, aggregation_type)
-                    if graphql_success:
-                        total_sent_graphql += len(clean_metrics)
-                        logger.info(f"Successfully sent {len(clean_metrics)} metrics with {aggregation_type} aggregation to GraphQL")
-                    else:
-                        failed_sends += 1
-                        logger.error(f"Failed to send {len(clean_metrics)} metrics with {aggregation_type} aggregation to GraphQL")
-                except Exception as e:
-                    failed_sends += 1
-                    logger.error(f"Exception sending {aggregation_type} metrics to GraphQL: {e}")
-            else:
-                logger.warning(f"No metrics found for {aggregation_type} aggregation - no mirrored hosts provided this data")
-        
-        # Consider success if we sent any data to either proxy, even if some failed
-        total_sent = total_sent_clickhouse + total_sent_graphql
-        if total_sent > 0:
-            logger.info(f"Overall success: sent {total_sent_clickhouse} metrics to ClickHouse, "
-                       f"{total_sent_graphql} metrics to GraphQL ({failed_sends} sends failed)")
-            return True
+        host_targets: Iterable[str]
+        if self.config.netdata_hosts:
+            host_targets = self.config.netdata_hosts
+        elif mirrored_hosts:
+            host_targets = mirrored_hosts
         else:
-            logger.error("No metrics were successfully sent to any proxy")
+            host_targets = []
+
+        collected: List[Dict[str, Any]] = []
+
+        if host_targets:
+            logger.info("Collecting metrics for hosts: %s", ", ".join(host_targets))
+            for host in host_targets:
+                collected.extend(self._collect_for_host(host))
+        else:
+            logger.info("Collecting metrics directly from %s", self.config.netdata_url)
+            collected.extend(self._collect_for_host(None, override_hostname=default_hostname))
+
+        logger.info("Collected %d metrics", len(collected))
+        return collected
+
+    def _collect_for_host(self, host: Optional[str], override_hostname: Optional[str] = None) -> List[Dict[str, Any]]:
+        host_label = host or override_hostname or "netdata"
+        metrics: List[Dict[str, Any]] = []
+        for chart_id in self.config.chart_ids:
+            for aggregation in self.config.aggregations:
+                payload = self.get_chart_data(host or "", chart_id, aggregation)
+                if not payload:
+                    continue
+                metrics.extend(self.parse_chart_response(payload, host_label, chart_id, aggregation))
+        return metrics
+
+    def send_to_graphql(self, metrics: List[Dict[str, Any]], aggregation: str) -> bool:
+        settings = next(
+            (details for details in AGGREGATION_SETTINGS.values() if details["group"] == aggregation),
+            None,
+        )
+        if not settings:
+            logger.error("Unknown aggregation '%s'", aggregation)
             return False
 
-    def run_continuous(self):
-        """Run continuously with specified interval"""
-        logger.info(f"Starting continuous mode - pulling every {INTERVAL_SECONDS} seconds")
-        
+        cleaned = []
+        for metric in metrics:
+            metric_copy = dict(metric)
+            metric_copy.pop("aggregation", None)
+            cleaned.append(metric_copy)
+
+        if not cleaned:
+            logger.warning("No metrics to send for aggregation '%s'", aggregation)
+            return False
+
+        endpoint_path = settings["endpoint"]
+        url = f"{self.config.graphql_proxy_url}/{endpoint_path}" if endpoint_path else self.config.graphql_proxy_url
+
+        try:
+            response = self.session.post(
+                url,
+                json=cleaned,
+                timeout=self.config.request_timeout,
+            )
+            response.raise_for_status()
+            logger.info(
+                "Forwarded %d metrics to %s (%s)",
+                len(cleaned),
+                url,
+                response.json().get("status", "unknown"),
+            )
+            return True
+        except requests.RequestException as exc:
+            logger.error(
+                "Failed to forward %d metrics to %s: %s",
+                len(cleaned),
+                url,
+                exc,
+            )
+            if exc.response is not None:
+                logger.debug("GraphQL proxy response: %s", exc.response.text)
+            return False
+
+    def run_once(self) -> bool:
+        metrics = self.collect_metrics()
+        if not metrics:
+            logger.warning("No metrics collected during this cycle")
+            return False
+
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for metric in metrics:
+            key = metric.get("aggregation", "average")
+            grouped.setdefault(key, []).append(metric)
+
+        success = False
+        for aggregation, items in grouped.items():
+            if self.send_to_graphql(items, aggregation):
+                success = True
+        return success
+
+    def run_continuous(self) -> None:
+        logger.info("Starting Netdata forwarder (interval: %ss)", self.config.interval_seconds)
         while True:
             try:
-                success = self.run_once()
-                if not success:
-                    logger.warning("Failed to process metrics this cycle")
-                    
+                self.run_once()
             except KeyboardInterrupt:
-                logger.info("Shutting down...")
+                logger.info("Stopping forwarder")
                 break
-            except Exception as e:
-                logger.error(f"Unexpected error: {e}")
-                
-            time.sleep(INTERVAL_SECONDS)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Unexpected error: %s", exc)
+            time.sleep(self.config.interval_seconds)
 
-def main():
-    forwarder = NetdataForwarder()
-    
-    if len(sys.argv) > 1 and sys.argv[1] == '--once':
-        # Run once and exit
-        success = forwarder.run_once()
-        sys.exit(0 if success else 1)
-    else:
-        # Run continuously
-        forwarder.run_continuous()
+
+def main() -> int:
+    config = Config()
+    forwarder = NetdataForwarder(config)
+    if len(sys.argv) > 1 and sys.argv[1] in {"--once", "once"}:
+        return 0 if forwarder.run_once() else 1
+    forwarder.run_continuous()
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

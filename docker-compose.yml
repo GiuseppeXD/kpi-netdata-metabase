@@ -1,156 +1,6 @@
 version: '3.8'
 
 services:
-  # ClickHouse Database with automatic initialization
-  clickhouse:
-    image: clickhouse/clickhouse-server:23.12-alpine
-    container_name: clickhouse-test
-    hostname: clickhouse
-    restart: unless-stopped
-    ports:
-      - "8123:8123"
-      - "9000:9000"
-    environment:
-      - CLICKHOUSE_DB=netdata_metrics
-    volumes:
-      - clickhouse-data:/var/lib/clickhouse
-      - ./clickhouse-init:/docker-entrypoint-initdb.d
-      - ./clickhouse-config/users.xml:/etc/clickhouse-server/users.xml
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-        reservations:
-          memory: 512M
-    ulimits:
-      nofile:
-        soft: 262144
-        hard: 262144
-    healthcheck:
-      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    networks:
-      - monitoring-network
-
-  # PostgreSQL for Metabase
-  postgres:
-    image: postgres:13
-    container_name: postgres-metabase
-    environment:
-      - POSTGRES_DB=metabase
-      - POSTGRES_USER=metabase
-      - POSTGRES_PASSWORD=metabase123
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U metabase"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    networks:
-      - monitoring-network
-
-  # Metabase Dashboard
-  metabase:
-    image: metabase/metabase:latest
-    container_name: metabase-dashboard
-    restart: unless-stopped
-    ports:
-      - "3000:3000"
-    environment:
-      - MB_DB_TYPE=postgres
-      - MB_DB_DBNAME=metabase
-      - MB_DB_PORT=5432
-      - MB_DB_USER=metabase
-      - MB_DB_PASS=metabase123
-      - MB_DB_HOST=postgres
-      - JAVA_OPTS=-Xmx2g
-    volumes:
-      - metabase-data:/metabase-data
-    depends_on:
-      postgres:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 120s
-    networks:
-      - monitoring-network
-
-  # Netdata to ClickHouse Proxy
-  netdata-clickhouse-proxy:
-    build:
-      context: ./netdata-proxy
-      dockerfile: Dockerfile
-    container_name: netdata-proxy
-    restart: unless-stopped
-    ports:
-      - "8080:8080"  # HTTP for endpoints, data generator and health checks
-      - "8081:8081"  # TCP for Netdata AVERAGE JSONL
-      - "8082:8082"  # TCP for Netdata MAXIMUM JSONL
-    environment:
-      - CLICKHOUSE_HOST=clickhouse
-      - CLICKHOUSE_PORT=8123
-      - CLICKHOUSE_USER=default
-      - CLICKHOUSE_PASSWORD=
-      - CLICKHOUSE_DATABASE=netdata_metrics
-      - LOG_LEVEL=info
-      - NODE_ENV=production
-    depends_on:
-      clickhouse:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8080/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-    networks:
-      - monitoring-network
-
-  # Netdata Parent Node (Test Instance)
-  netdata-parent:
-    image: netdata/netdata:v2.6.1
-    container_name: netdata-parent
-    hostname: netdata-parent-test
-    restart: unless-stopped
-    ports:
-      - "19998:19998"
-    cap_add:
-      - SYS_PTRACE
-      - SYS_ADMIN
-    security_opt:
-      - apparmor:unconfined
-    volumes:
-      - ./netdata-config:/etc/netdata
-      - netdata-parent-lib:/var/lib/netdata
-      - netdata-parent-cache:/var/cache/netdata
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /etc/passwd:/host/etc/passwd:ro
-      - /etc/group:/host/etc/group:ro
-    environment:
-      - NETDATA_DISABLE_CLOUD=1
-      - NETDATA_EXTRA_DBS=yes
-    depends_on:
-      netdata-clickhouse-proxy:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:19998/api/v1/info"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-    networks:
-      - monitoring-network
-
-  # Netdata to GraphQL Proxy
   netdata-graphql-proxy:
     build:
       context: ./netdata-proxy-graphql
@@ -158,16 +8,16 @@ services:
     container_name: netdata-graphql-proxy
     restart: unless-stopped
     ports:
-      - "8090:8090"  # HTTP for endpoints and health checks
-      - "8091:8091"  # TCP for Netdata AVERAGE JSONL
-      - "8092:8092"  # TCP for Netdata MAXIMUM JSONL
+      - "8090:8090"
+      - "8091:8091"
+      - "8092:8092"
+    env_file:
+      - .env
     environment:
-      - GRAPHQL_ENDPOINT=https://digitalize.oxeanbits.com/graphql
-      - SHEET_ID=68bf175e85d08f78bf97b15f
-      - API_KEY=${API_KEY}
-      - LOG_LEVEL=info
-      - NODE_ENV=production
-      - PORT=8090
+      GRAPHQL_ENDPOINT: ${GRAPHQL_ENDPOINT:-https://digitalize.oxeanbits.com/graphql}
+      SHEET_ID: ${SHEET_ID:-68bf175e85d08f78bf97b15f}
+      PORT: ${PORT:-8090}
+      GRAPHQL_BATCH_SIZE: ${GRAPHQL_BATCH_SIZE:-20}
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8090/health"]
       interval: 30s
@@ -175,43 +25,34 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - monitoring-network
+      - netdata-export
 
-  # Netdata Forwarder (SSH Tunnel Metrics)
-  #netdata-forwarder:
-  #  image: python:3.11-slim
-  #  container_name: netdata-forwarder
-  #  restart: unless-stopped
-  #  network_mode: "host"
-  #  volumes:
-  #    - ./netdata-forwarder.py:/app/netdata-forwarder.py:ro
-  #  working_dir: /app
-  #  command: >
-  #    sh -c "
-  #      pip install requests &&
-  #      python netdata-forwarder.py
-  #    "
-  #  environment:
-  #    - PYTHONUNBUFFERED=1
-  #  depends_on:
-  #    netdata-clickhouse-proxy:
-  #      condition: service_healthy
-
-volumes:
-  clickhouse-data:
-    driver: local
-  postgres-data:
-    driver: local
-  metabase-data:
-    driver: local
-  netdata-parent-lib:
-    driver: local
-  netdata-parent-cache:
-    driver: local
+  netdata-forwarder:
+    image: python:3.11-slim
+    container_name: netdata-forwarder
+    restart: unless-stopped
+    depends_on:
+      netdata-graphql-proxy:
+        condition: service_healthy
+    working_dir: /app
+    command: >
+      sh -c "pip install --no-cache-dir requests && python netdata-forwarder.py"
+    volumes:
+      - ./netdata-forwarder.py:/app/netdata-forwarder.py:ro
+    environment:
+      NETDATA_URL: ${NETDATA_URL:-http://host.docker.internal:19999}
+      GRAPHQL_PROXY_URL: ${GRAPHQL_PROXY_URL:-http://netdata-graphql-proxy:8090}
+      CHARTS: ${CHARTS:-system.cpu,disk_space./}
+      AGGREGATION_TYPES: ${AGGREGATION_TYPES:-average,median,max}
+      NETDATA_HOSTS: ${NETDATA_HOSTS:-}
+      INTERVAL_SECONDS: ${INTERVAL_SECONDS:-60}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-120}
+      LOG_LEVEL: ${FORWARDER_LOG_LEVEL:-INFO}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - netdata-export
 
 networks:
-  monitoring-network:
+  netdata-export:
     driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/16

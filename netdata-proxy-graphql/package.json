@@ -1,7 +1,7 @@
 {
-  "name": "netdata-clickhouse-proxy",
+  "name": "netdata-graphql-proxy",
   "version": "1.0.0",
-  "description": "Proxy to convert Netdata JSON exports to ClickHouse format",
+  "description": "Proxy to send Netdata JSON exports to GraphQL API",
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
@@ -9,16 +9,16 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "@clickhouse/client": "^1.12.0",
+    "express": "^4.18.2",
     "axios": "^1.6.0",
-    "express": "^4.18.2"
+    "uuid": "^9.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
   },
   "keywords": [
     "netdata",
-    "clickhouse",
+    "graphql",
     "proxy",
     "metrics"
   ],
