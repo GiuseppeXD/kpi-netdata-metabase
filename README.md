@@ -61,6 +61,7 @@ All runtime settings can be supplied through `.env` or the shell. Key variables:
 | `NETDATA_URL` | Netdata base URL | `http://host.docker.internal:19999` |
 | `GRAPHQL_PROXY_URL` | Proxy URL used by the forwarder | `http://netdata-graphql-proxy:8090` |
 | `CHARTS` | Comma-separated Netdata chart IDs to query | `system.cpu,disk_space./` |
+| `CHART_FILTER` | Substring filter applied to `CHARTS` (`*` disables filtering) | `disk_space` |
 | `AGGREGATION_TYPES` | Comma-separated aggregations (`average`, `median`, `max`) | `average,median,max` |
 | `NETDATA_HOSTS` | Optional list of mirrored hostnames to poll | _(auto-detected)_ |
 | `INTERVAL_SECONDS` | Polling interval | `60` |

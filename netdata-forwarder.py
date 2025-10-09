@@ -12,6 +12,7 @@ import os
 import sys
 import time
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import quote
 
 import requests
 
@@ -41,13 +42,20 @@ class Config:
         self.request_timeout = int(os.getenv("REQUEST_TIMEOUT", "120"))
         self.skip_tls_verify = os.getenv("NETDATA_SKIP_TLS_VERIFY", "false").lower() == "true"
         self.netdata_hosts = self._split_list(os.getenv("NETDATA_HOSTS", ""))
-        self.chart_ids = [
-            chart_id
-            for chart_id in self._split_list(os.getenv("CHARTS", "system.cpu,disk_space./"))
-            if "disk_space" in chart_id
-        ]
-        if not self.chart_ids:
-            # Ensure we always collect at least the root disk when filtering.
+        self.chart_filter = os.getenv("CHART_FILTER", "*").strip()
+        raw_chart_ids = self._split_list(os.getenv("CHARTS", "system.cpu,disk_space./"))
+        if self.chart_filter and self.chart_filter != "*":
+            filtered = [chart_id for chart_id in raw_chart_ids if self.chart_filter in chart_id]
+        else:
+            filtered = raw_chart_ids
+
+        if filtered:
+            self.chart_ids = filtered
+        else:
+            logger.warning(
+                "No chart IDs matched filter '%s'; falling back to 'disk_space./'",
+                self.chart_filter or "*",
+            )
             self.chart_ids = ["disk_space./"]
         self.aggregations = self._parse_aggregations(os.getenv("AGGREGATION_TYPES", "average,median,max"))
 
@@ -97,16 +105,33 @@ class NetdataForwarder:
             "format": "json",
         }
         try:
+            fallback_attempted = False
+            urls_to_try: List[str] = []
             if hostname:
-                url = f"{self.config.netdata_url}/host/{hostname}/api/v1/data"
-            else:
-                url = f"{self.config.netdata_url}/api/v1/data"
-            response = self.session.get(url, params=params, timeout=self.config.request_timeout)
-            if response.status_code == 404 and hostname:
-                logger.warning("Host '%s' not found for chart '%s'", hostname, chart_id)
-                return None
-            response.raise_for_status()
-            return response.json()
+                host_slug = quote(hostname.strip())
+                urls_to_try.append(f"{self.config.netdata_url}/host/{host_slug}/api/v1/data")
+            urls_to_try.append(f"{self.config.netdata_url}/api/v1/data")
+
+            for idx, url in enumerate(urls_to_try):
+                effective_params = dict(params)
+                if hostname and idx > 0:
+                    effective_params["host"] = hostname
+                response = self.session.get(url, params=effective_params, timeout=self.config.request_timeout)
+                if response.status_code == 404 and hostname:
+                    if idx == 0:
+                        fallback_attempted = True
+                        continue
+                    logger.warning("Host '%s' not found for chart '%s'", hostname, chart_id)
+                    return None
+                response.raise_for_status()
+                if fallback_attempted:
+                    logger.debug(
+                        "Successfully fetched chart '%s' for host '%s' via fallback endpoint",
+                        chart_id,
+                        hostname,
+                    )
+                return response.json()
+            return None
         except requests.RequestException as exc:
             logger.warning(
                 "Failed to get %s aggregation for %s (host=%s): %s",
@@ -174,23 +199,43 @@ class NetdataForwarder:
 
         host_targets: Iterable[str]
         if self.config.netdata_hosts:
-            host_targets = self.config.netdata_hosts
+            host_targets = self._dedupe(self.config.netdata_hosts)
         elif mirrored_hosts:
-            host_targets = mirrored_hosts
+            host_targets = self._normalize_hosts(mirrored_hosts)
         else:
             host_targets = []
 
         collected: List[Dict[str, Any]] = []
+        per_host_counts: Dict[str, int] = {}
 
         if host_targets:
             logger.info("Collecting metrics for hosts: %s", ", ".join(host_targets))
             for host in host_targets:
-                collected.extend(self._collect_for_host(host))
+                host_metrics = self._collect_for_host(host)
+                collected.extend(host_metrics)
+                per_host_counts[host] = len(host_metrics)
+                if host_metrics:
+                    logger.info("Collected %d metrics for host '%s'", len(host_metrics), host)
+                else:
+                    logger.warning("No metrics collected for host '%s'", host)
         else:
             logger.info("Collecting metrics directly from %s", self.config.netdata_url)
-            collected.extend(self._collect_for_host(None, override_hostname=default_hostname))
+            host_label = default_hostname or "netdata"
+            host_metrics = self._collect_for_host(None, override_hostname=default_hostname)
+            collected.extend(host_metrics)
+            per_host_counts[host_label] = len(host_metrics)
+            if host_metrics:
+                logger.info("Collected %d metrics for host '%s'", len(host_metrics), host_label)
+            else:
+                logger.warning("No metrics collected for host '%s'", host_label)
 
-        logger.info("Collected %d metrics", len(collected))
+        missing_hosts = [host for host, count in per_host_counts.items() if count == 0]
+        if missing_hosts:
+            logger.warning("Unable to collect metrics for %d host(s): %s", len(missing_hosts), ", ".join(missing_hosts))
+        elif per_host_counts:
+            logger.info("Successfully collected metrics for all %d host(s)", len(per_host_counts))
+
+        logger.info("Collected %d metrics in total", len(collected))
         return collected
 
     def _collect_for_host(self, host: Optional[str], override_hostname: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -203,6 +248,36 @@ class NetdataForwarder:
                     continue
                 metrics.extend(self.parse_chart_response(payload, host_label, chart_id, aggregation))
         return metrics
+
+    @staticmethod
+    def _dedupe(items: Iterable[str]) -> List[str]:
+        seen: dict[str, None] = {}
+        for item in items:
+            if not item:
+                continue
+            normalized = item.strip()
+            if not normalized:
+                continue
+            if normalized not in seen:
+                seen[normalized] = None
+        return list(seen.keys())
+
+    def _normalize_hosts(self, hosts: Iterable[Any]) -> List[str]:
+        normalized: List[str] = []
+        for host in hosts:
+            candidate: Optional[str] = None
+            if isinstance(host, str):
+                candidate = host
+            elif isinstance(host, dict):
+                candidate = (
+                    host.get("hostname")
+                    or host.get("name")
+                    or host.get("machine_guid")
+                    or host.get("id")
+                )
+            if candidate:
+                normalized.append(candidate)
+        return self._dedupe(normalized)
 
     def send_to_graphql(self, metrics: List[Dict[str, Any]], aggregation: str) -> bool:
         settings = next(
