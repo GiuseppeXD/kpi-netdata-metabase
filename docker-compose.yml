@@ -45,7 +45,7 @@ services:
       CHARTS: ${CHARTS:-system.cpu,disk_space./}
       AGGREGATION_TYPES: ${AGGREGATION_TYPES:-average,median,max}
       NETDATA_HOSTS: ${NETDATA_HOSTS:-}
-      INTERVAL_SECONDS: ${INTERVAL_SECONDS:-60}
+      INTERVAL_SECONDS: ${INTERVAL_SECONDS:-120}
       REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-120}
       LOG_LEVEL: ${FORWARDER_LOG_LEVEL:-INFO}
     extra_hosts:
