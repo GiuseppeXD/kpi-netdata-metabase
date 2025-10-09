@@ -9,8 +9,6 @@ services:
     restart: unless-stopped
     ports:
       - "8090:8090"
-      - "8091:8091"
-      - "8092:8092"
     env_file:
       - .env
     environment:
@@ -45,7 +43,7 @@ services:
       CHARTS: ${CHARTS:-system.cpu,disk_space./}
       AGGREGATION_TYPES: ${AGGREGATION_TYPES:-average,median,max}
       NETDATA_HOSTS: ${NETDATA_HOSTS:-}
-      INTERVAL_SECONDS: ${INTERVAL_SECONDS:-120}
+      INTERVAL_SECONDS: ${INTERVAL_SECONDS:-3600}
       REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-120}
       LOG_LEVEL: ${FORWARDER_LOG_LEVEL:-INFO}
     extra_hosts:

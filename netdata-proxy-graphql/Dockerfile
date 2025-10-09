@@ -19,8 +19,8 @@ RUN addgroup -g 1001 -S nodejs && \
 RUN chown -R nodeuser:nodejs /app
 USER nodeuser
 
-# Expose ports
-EXPOSE 8090 8091 8092
+# Expose HTTP port only
+EXPOSE 8090
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

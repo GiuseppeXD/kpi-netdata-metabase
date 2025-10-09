@@ -38,30 +38,27 @@ class Config:
     def __init__(self) -> None:
         self.netdata_url = os.getenv("NETDATA_URL", "http://localhost:19999").rstrip("/")
         self.graphql_proxy_url = os.getenv("GRAPHQL_PROXY_URL", "http://localhost:8090").rstrip("/")
-        self.interval_seconds = int(os.getenv("INTERVAL_SECONDS", "60"))
+        self.interval_seconds = int(os.getenv("INTERVAL_SECONDS", str(60 * 60)))
         self.request_timeout = int(os.getenv("REQUEST_TIMEOUT", "120"))
         self.skip_tls_verify = os.getenv("NETDATA_SKIP_TLS_VERIFY", "false").lower() == "true"
         self.netdata_hosts = self._split_list(os.getenv("NETDATA_HOSTS", ""))
-        self.chart_filter = os.getenv("CHART_FILTER", "*").strip()
+        self.chart_filter = os.getenv("CHART_FILTER", "disk_space").strip()
         raw_chart_ids = self._split_list(os.getenv("CHARTS", "system.cpu,disk_space./"))
-        if self.chart_filter and self.chart_filter != "*":
-            filtered = [chart_id for chart_id in raw_chart_ids if self.chart_filter in chart_id]
+        if raw_chart_ids:
+            self.chart_ids = raw_chart_ids
         else:
-            filtered = raw_chart_ids
-
-        if filtered:
-            self.chart_ids = filtered
-        else:
-            logger.warning(
-                "No chart IDs matched filter '%s'; falling back to 'disk_space./'",
-                self.chart_filter or "*",
-            )
+            logger.warning("No chart IDs configured; defaulting to 'disk_space./'")
             self.chart_ids = ["disk_space./"]
         self.aggregations = self._parse_aggregations(os.getenv("AGGREGATION_TYPES", "average,median,max"))
 
     @staticmethod
     def _split_list(raw: str) -> List[str]:
         return [item.strip() for item in raw.split(",") if item.strip()]
+
+    def filter_chart_ids(self, chart_ids: Iterable[str]) -> List[str]:
+        if self.chart_filter and self.chart_filter != "*":
+            return [chart_id for chart_id in chart_ids if self.chart_filter in chart_id]
+        return list(chart_ids)
 
     def _parse_aggregations(self, raw: str) -> List[str]:
         parsed: List[str] = []
@@ -83,6 +80,7 @@ class NetdataForwarder:
         self.config = config
         self.session = requests.Session()
         self.session.verify = not config.skip_tls_verify
+        self.chart_catalog_cache: Dict[str, Dict[str, Any]] = {}
 
     def get_netdata_info(self) -> Optional[Dict[str, Any]]:
         try:
@@ -240,13 +238,27 @@ class NetdataForwarder:
 
     def _collect_for_host(self, host: Optional[str], override_hostname: Optional[str] = None) -> List[Dict[str, Any]]:
         host_label = host or override_hostname or "netdata"
+        catalog = self._fetch_chart_catalog(host)
+        chart_ids = self._resolve_chart_ids_for_host(host, catalog)
+        volumes = self._extract_volume_labels(chart_ids, catalog)
+        if volumes:
+            logger.info(
+                "Discovered %d volume chart(s) for host '%s': %s",
+                len(volumes),
+                host_label,
+                ", ".join(sorted(volumes.values())),
+            )
+        elif any(chart_id.startswith("disk_space") for chart_id in chart_ids):
+            logger.warning("No volume metadata found for host '%s'", host_label)
+
         metrics: List[Dict[str, Any]] = []
-        for chart_id in self.config.chart_ids:
+        for chart_id in chart_ids:
             for aggregation in self.config.aggregations:
                 payload = self.get_chart_data(host or "", chart_id, aggregation)
                 if not payload:
                     continue
-                metrics.extend(self.parse_chart_response(payload, host_label, chart_id, aggregation))
+                display_host = self._format_hostname_for_chart(host_label, chart_id, volumes)
+                metrics.extend(self.parse_chart_response(payload, display_host, chart_id, aggregation))
         return metrics
 
     @staticmethod
@@ -278,6 +290,190 @@ class NetdataForwarder:
             if candidate:
                 normalized.append(candidate)
         return self._dedupe(normalized)
+
+    def _fetch_chart_catalog(self, host: Optional[str]) -> Dict[str, Any]:
+        cache_key = host or "__self__"
+        if cache_key in self.chart_catalog_cache:
+            return self.chart_catalog_cache[cache_key]
+
+        urls_to_try: List[str] = []
+        fallback_attempted = False
+        if host:
+            host_slug = quote(host.strip())
+            urls_to_try.append(f"{self.config.netdata_url}/host/{host_slug}/api/v1/charts")
+        urls_to_try.append(f"{self.config.netdata_url}/api/v1/charts")
+
+        for idx, url in enumerate(urls_to_try):
+            params: Dict[str, Any] = {}
+            if host and idx > 0:
+                params["host"] = host
+            try:
+                response = self.session.get(url, params=params or None, timeout=self.config.request_timeout)
+                if response.status_code == 404 and host:
+                    if idx == 0:
+                        fallback_attempted = True
+                        continue
+                    logger.debug("Charts for host '%s' not found (HTTP 404)", host)
+                    break
+                response.raise_for_status()
+                data = response.json()
+                chart_map = self._extract_chart_map(data)
+                if chart_map:
+                    if fallback_attempted:
+                        logger.debug("Discovered charts for host '%s' via fallback endpoint", host)
+                    self.chart_catalog_cache[cache_key] = chart_map
+                    return chart_map
+                logger.debug(
+                    "Unexpected chart catalog format for host '%s': %s",
+                    host or "self",
+                    type(data).__name__,
+                )
+            except requests.RequestException as exc:
+                logger.debug(
+                    "Failed to fetch chart catalog for host '%s' from %s: %s",
+                    host or "self",
+                    url,
+                    exc,
+                )
+        self.chart_catalog_cache[cache_key] = {}
+        return {}
+
+    @staticmethod
+    def _extract_chart_map(payload: Any) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        if "charts" in payload and isinstance(payload["charts"], dict):
+            return payload["charts"]
+        # Some Netdata versions use "data" wrapper
+        if "data" in payload and isinstance(payload["data"], dict):
+            return payload["data"]
+        # Heuristic: if values look like chart definitions, accept payload as-is
+        sample = next(iter(payload.values()), None)
+        if isinstance(sample, dict) and any(key in sample for key in ("chart", "id", "name", "context")):
+            return payload
+        return {}
+
+    def _resolve_chart_ids_for_host(self, host: Optional[str], catalog: Dict[str, Any]) -> List[str]:
+        discovered_ids = list(catalog.keys()) if catalog else []
+        filtered_discovered = self.config.filter_chart_ids(discovered_ids)
+        combined = list(self.config.chart_ids)
+        for chart_id in filtered_discovered:
+            if chart_id not in combined:
+                combined.append(chart_id)
+        if not combined:
+            combined = ["disk_space./"]
+        return combined
+
+    def _format_hostname_for_chart(
+        self,
+        base_host_label: str,
+        chart_id: str,
+        volumes: Optional[Dict[str, str]],
+    ) -> str:
+        if volumes and chart_id in volumes:
+            volume_label = volumes[chart_id]
+            if volume_label and volume_label != "root":
+                return f"{base_host_label}/{volume_label}"
+        return base_host_label
+
+    def _extract_volume_labels(
+        self,
+        chart_ids: Iterable[str],
+        catalog: Optional[Dict[str, Any]],
+    ) -> Dict[str, str]:
+        volumes: Dict[str, str] = {}
+        if not isinstance(catalog, dict):
+            catalog = {}
+        for chart_id in chart_ids:
+            if not chart_id.startswith("disk_space"):
+                continue
+            chart_info = catalog.get(chart_id, {})
+            volume_name = self._derive_volume_name(chart_id, chart_info)
+            sanitized = self._sanitize_volume_label(volume_name)
+            if sanitized:
+                volumes[chart_id] = sanitized
+        return volumes
+
+    def _derive_volume_name(self, chart_id: str, chart_info: Any) -> str:
+        candidates: List[str] = []
+        if isinstance(chart_info, dict):
+            for key in ("mount_point", "path", "name", "chart", "id", "context", "title", "family"):
+                value = chart_info.get(key)
+                if isinstance(value, str) and value.strip():
+                    candidates.append(value.strip())
+            labels = chart_info.get("chart_labels")
+            if isinstance(labels, dict):
+                for key in ("mount_point", "mountpoint", "mount", "path", "volume", "fs", "filesystem", "family"):
+                    value = labels.get(key)
+                    if isinstance(value, str) and value.strip():
+                        candidates.append(value.strip())
+        candidates.append(chart_id)
+
+        for candidate in candidates:
+            normalized = self._normalize_volume_identifier(candidate)
+            if normalized:
+                return normalized
+        return chart_id
+
+    @staticmethod
+    def _normalize_volume_identifier(value: str) -> str:
+        if not value:
+            return ""
+        raw = value.strip()
+        if not raw:
+            return ""
+        if raw.startswith("disk_space."):
+            raw = raw.split("disk_space.", 1)[1]
+        normalized = NetdataForwarder._normalize_volume_suffix(raw)
+        if normalized:
+            return normalized
+        return NetdataForwarder._normalize_volume_suffix(NetdataForwarder._chart_root_path_from_metadata(value))
+
+    @staticmethod
+    def _chart_root_path_from_metadata(raw: str) -> str:
+        # Attempt to recover path hints embedded in raw metadata strings.
+        if not raw:
+            return ""
+        if "mount_point" in raw:
+            return raw.split("mount_point", 1)[-1]
+        return raw
+
+    @staticmethod
+    def _normalize_volume_suffix(suffix: str) -> str:
+        cleaned = suffix.strip()
+        if not cleaned:
+            return "/"
+        if cleaned in {"/", "./"}:
+            return "/"
+        if cleaned in {"_", "._"}:
+            return "/"
+        if cleaned.startswith("./"):
+            remainder = cleaned[1:].strip()
+            return remainder or "/"
+        if cleaned.startswith("/"):
+            return cleaned
+        if cleaned.startswith("_"):
+            body = cleaned[1:]
+            path = body.replace("_", "/").strip()
+            return f"/{path}" if path else "/"
+        if cleaned.startswith("."):
+            body = cleaned[1:]
+            return f"/{body}" if body else "/"
+        return cleaned
+
+    @staticmethod
+    def _sanitize_volume_label(volume_name: str) -> str:
+        if not volume_name:
+            return ""
+        trimmed = volume_name.strip()
+        if not trimmed or trimmed == "/":
+            return "root"
+        if trimmed.startswith("mount_point="):
+            trimmed = trimmed.split("=", 1)[1]
+        if trimmed.startswith("/" ) and "mount_point" in volume_name:
+            trimmed = trimmed.split("mount_point", 1)[0].strip()
+        without_slash = trimmed.lstrip("/")
+        return without_slash or "root"
 
     def send_to_graphql(self, metrics: List[Dict[str, Any]], aggregation: str) -> bool:
         settings = next(
